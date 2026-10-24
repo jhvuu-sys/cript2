@@ -1,93 +1,348 @@
---- Ball landing predictor: marks where the ball will land
+--- Ball landing predictor with trajectory arc, color panel, and on/off switches
 
+local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 
+local player = Players.LocalPlayer
+
 -- Settings
-local BALL_NAME = "Ball"          -- change to the ball's actual name in the game
-local STEP = 1 / 60               -- simulation step (seconds)
+local BALL_NAME = "Ball"          -- change to your ball's actual name
+local STEP = 1 / 30               -- simulation step (seconds)
 local MAX_TIME = 6                -- how far ahead to predict (seconds)
-local MARKER_COLOR = Color3.fromRGB(255, 70, 70)
+
+local ARC_STRIDE = 2              -- draw one segment per this many steps (higher = fewer parts)
+local ARC_THICKNESS = 0.25
+local ARC_TRANSPARENCY = 0.35
+local ARC_DASHED = true           -- true = dashed line, false = solid
+
+local enabled = true
+local arcEnabled = true
+local markerColor = Color3.fromRGB(255, 70, 70)
+
+local PRESETS = {
+    Color3.fromRGB(255, 70, 70),   -- red
+    Color3.fromRGB(255, 160, 40),  -- orange
+    Color3.fromRGB(250, 220, 60),  -- yellow
+    Color3.fromRGB(60, 220, 100),  -- green
+    Color3.fromRGB(70, 160, 255),  -- blue
+    Color3.fromRGB(190, 100, 255), -- purple
+}
 
 local ball
-local lastPos, lastTime
-local estVel = Vector3.zero       -- fallback velocity if the ball has no physics velocity
+local lastPos
+local estVel = Vector3.zero
 
--- Landing marker (flat glowing disc)
+---------------------------------------------------------------------
+-- Marker, highlight, and arc
+---------------------------------------------------------------------
 local marker = Instance.new("Part")
 marker.Name = "LandingMarker"
 marker.Shape = Enum.PartType.Cylinder
 marker.Size = Vector3.new(0.15, 5, 5)
-marker.Orientation = Vector3.new(0, 0, 90)
 marker.Anchored = true
 marker.CanCollide = false
 marker.CanQuery = false
 marker.CanTouch = false
 marker.Material = Enum.Material.Neon
-marker.Color = MARKER_COLOR
-marker.Transparency = 0.35
+marker.Transparency = 1
 marker.Parent = Workspace
 
--- Outline on the ball itself
 local highlight = Instance.new("Highlight")
-highlight.FillColor = MARKER_COLOR
 highlight.FillTransparency = 0.6
 highlight.OutlineColor = Color3.new(1, 1, 1)
 highlight.Parent = Workspace
 
+-- Arc segments live in one folder so the raycast can ignore them all
+local arcFolder = Instance.new("Folder")
+arcFolder.Name = "TrajectoryArc"
+arcFolder.Parent = Workspace
+
+local segments = {}  -- pooled parts, reused every frame
+
+local function getSegment(index)
+    local seg = segments[index]
+    if not seg then
+        seg = Instance.new("Part")
+        seg.Anchored = true
+        seg.CanCollide = false
+        seg.CanQuery = false
+        seg.CanTouch = false
+        seg.CastShadow = false
+        seg.Material = Enum.Material.Neon
+        seg.Transparency = 1
+        seg.Parent = arcFolder
+        segments[index] = seg
+    end
+    return seg
+end
+
+local function hideArc()
+    for _, seg in ipairs(segments) do
+        seg.Transparency = 1
+    end
+end
+
+local function drawArc(points)
+    local used = 0
+    local i = 1
+    while i < #points do
+        local j = math.min(i + ARC_STRIDE, #points)
+        used += 1
+
+        local a, b = points[i], points[j]
+        local length = (b - a).Magnitude
+        local seg = getSegment(used)
+
+        if length > 0.01 and not (ARC_DASHED and used % 2 == 0) then
+            seg.Size = Vector3.new(ARC_THICKNESS, ARC_THICKNESS, length)
+            seg.CFrame = CFrame.lookAt((a + b) / 2, b)
+            seg.Color = markerColor
+            seg.Transparency = ARC_TRANSPARENCY
+        else
+            seg.Transparency = 1
+        end
+
+        i = j
+    end
+
+    -- Hide leftover segments from a longer arc on a previous frame
+    for k = used + 1, #segments do
+        segments[k].Transparency = 1
+    end
+end
+
+local function setMarkerColor(color)
+    markerColor = color
+    marker.Color = color
+    highlight.FillColor = color
+    -- arc segments pick up the new color on the next draw
+end
+setMarkerColor(markerColor)
+
+local function hideVisuals()
+    marker.Transparency = 1
+    highlight.Adornee = nil
+    hideArc()
+end
+
+---------------------------------------------------------------------
+-- Prediction
+---------------------------------------------------------------------
 local function findBall()
     local found = Workspace:FindFirstChild(BALL_NAME, true)
     if found and found:IsA("BasePart") then return found end
-    if found and found:IsA("Model") then return found.PrimaryPart or found:FindFirstChildWhichIsA("BasePart") end
+    if found and found:IsA("Model") then
+        return found.PrimaryPart or found:FindFirstChildWhichIsA("BasePart")
+    end
 end
 
-local function getVelocity(dt)
+local function getVelocity()
     local v = ball.AssemblyLinearVelocity
     if v.Magnitude > 0.1 then return v end
-    return estVel  -- anchored or custom-moved ball: use position changes instead
+    return estVel
 end
 
+-- Returns the landing position (or nil) and every point along the path
 local function predictLanding(pos, vel)
     local gravity = Vector3.new(0, -Workspace.Gravity, 0)
+
+    local ignore = { ball, marker, arcFolder }
+    if player.Character then table.insert(ignore, player.Character) end
+
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = { ball, marker, game.Players.LocalPlayer.Character }
+    params.FilterDescendantsInstances = ignore
 
+    local points = { pos }
     local t = 0
     while t < MAX_TIME do
         local newPos = pos + vel * STEP + 0.5 * gravity * STEP * STEP
         local hit = Workspace:Raycast(pos, newPos - pos, params)
-        if hit then return hit.Position end
+        if hit then
+            table.insert(points, hit.Position)
+            return hit.Position, points
+        end
+        table.insert(points, newPos)
         vel = vel + gravity * STEP
         pos = newPos
         t += STEP
     end
-    return nil
+    return nil, points
 end
 
 RunService.Heartbeat:Connect(function(dt)
-    if not ball or not ball.Parent then
-        ball = findBall()
+    if not enabled then
+        hideVisuals()
         lastPos = nil
-        marker.Transparency = 1
-        highlight.Adornee = nil
         return
     end
 
-    -- Estimate velocity from movement (smoothed)
+    if not ball or not ball.Parent then
+        ball = findBall()
+        lastPos = nil
+        hideVisuals()
+        return
+    end
+
     if lastPos and dt > 0 then
-        local raw = (ball.Position - lastPos) / dt
-        estVel = estVel:Lerp(raw, 0.5)
+        estVel = estVel:Lerp((ball.Position - lastPos) / dt, 0.5)
     end
     lastPos = ball.Position
 
     highlight.Adornee = ball
 
-    local landing = predictLanding(ball.Position, getVelocity(dt))
+    local landing, points = predictLanding(ball.Position, getVelocity())
+
     if landing then
         marker.Transparency = 0.35
         marker.CFrame = CFrame.new(landing + Vector3.new(0, 0.1, 0)) * CFrame.Angles(0, 0, math.rad(90))
     else
         marker.Transparency = 1
     end
+
+    if arcEnabled then
+        drawArc(points)
+    else
+        hideArc()
+    end
 end)
+
+---------------------------------------------------------------------
+-- Settings panel
+---------------------------------------------------------------------
+local function styleToggle(btn, on)
+    btn.Text = on and "ON" or "OFF"
+    btn.BackgroundColor3 = on
+        and Color3.fromRGB(35, 165, 89)
+        or Color3.fromRGB(190, 60, 60)
+end
+
+local function createPanel()
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "MarkerColorPanel"
+    gui.ResetOnSpawn = false
+    gui.Parent = player:WaitForChild("PlayerGui")
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(0, 230, 0, 184)
+    frame.Position = UDim2.new(0, 20, 0.5, -92)
+    frame.BackgroundColor3 = Color3.fromRGB(30, 30, 34)
+    frame.BorderSizePixel = 0
+    frame.Active = true
+    frame.Draggable = true  -- deprecated but still works; drag the panel anywhere
+    frame.Parent = gui
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -90, 0, 24)
+    title.Position = UDim2.new(0, 10, 0, 8)
+    title.BackgroundTransparency = 1
+    title.Text = "Landing Marker"
+    title.TextColor3 = Color3.new(1, 1, 1)
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 14
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = frame
+
+    -- Main ON/OFF switch
+    local toggleBtn = Instance.new("TextButton")
+    toggleBtn.Size = UDim2.new(0, 60, 0, 24)
+    toggleBtn.Position = UDim2.new(1, -70, 0, 8)
+    toggleBtn.Font = Enum.Font.GothamBold
+    toggleBtn.TextSize = 12
+    toggleBtn.TextColor3 = Color3.new(1, 1, 1)
+    toggleBtn.Parent = frame
+    Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(0, 5)
+    styleToggle(toggleBtn, enabled)
+
+    toggleBtn.Activated:Connect(function()
+        enabled = not enabled
+        styleToggle(toggleBtn, enabled)
+        if not enabled then hideVisuals() end
+    end)
+
+    -- Preset swatches
+    for i, color in ipairs(PRESETS) do
+        local swatch = Instance.new("TextButton")
+        swatch.Size = UDim2.new(0, 28, 0, 28)
+        swatch.Position = UDim2.new(0, 10 + (i - 1) * 35, 0, 48)
+        swatch.BackgroundColor3 = color
+        swatch.Text = ""
+        swatch.Parent = frame
+        Instance.new("UICorner", swatch).CornerRadius = UDim.new(0, 6)
+
+        swatch.Activated:Connect(function()
+            setMarkerColor(color)
+        end)
+    end
+
+    -- Custom hex color
+    local hexLabel = Instance.new("TextLabel")
+    hexLabel.Size = UDim2.new(0, 50, 0, 26)
+    hexLabel.Position = UDim2.new(0, 10, 0, 90)
+    hexLabel.BackgroundTransparency = 1
+    hexLabel.Text = "Hex #"
+    hexLabel.TextColor3 = Color3.new(1, 1, 1)
+    hexLabel.Font = Enum.Font.GothamMedium
+    hexLabel.TextSize = 13
+    hexLabel.TextXAlignment = Enum.TextXAlignment.Left
+    hexLabel.Parent = frame
+
+    local hexBox = Instance.new("TextBox")
+    hexBox.Size = UDim2.new(1, -80, 0, 26)
+    hexBox.Position = UDim2.new(0, 60, 0, 90)
+    hexBox.BackgroundColor3 = Color3.fromRGB(50, 50, 58)
+    hexBox.BorderSizePixel = 0
+    hexBox.PlaceholderText = "FF4646"
+    hexBox.Text = ""
+    hexBox.TextColor3 = Color3.new(1, 1, 1)
+    hexBox.Font = Enum.Font.Gotham
+    hexBox.TextSize = 13
+    hexBox.ClearTextOnFocus = false
+    hexBox.Parent = frame
+    Instance.new("UICorner", hexBox).CornerRadius = UDim.new(0, 5)
+
+    hexBox.FocusLost:Connect(function()
+        local hex = hexBox.Text:gsub("#", ""):gsub("%s", "")
+        if #hex == 6 and hex:match("^%x+$") then
+            setMarkerColor(Color3.fromRGB(
+                tonumber(hex:sub(1, 2), 16),
+                tonumber(hex:sub(3, 4), 16),
+                tonumber(hex:sub(5, 6), 16)
+            ))
+        else
+            hexBox.Text = ""  -- invalid input, keep the current color
+        end
+    end)
+
+    -- Arc ON/OFF switch
+    local arcLabel = Instance.new("TextLabel")
+    arcLabel.Size = UDim2.new(1, -90, 0, 24)
+    arcLabel.Position = UDim2.new(0, 10, 0, 134)
+    arcLabel.BackgroundTransparency = 1
+    arcLabel.Text = "Trajectory Arc"
+    arcLabel.TextColor3 = Color3.new(1, 1, 1)
+    arcLabel.Font = Enum.Font.GothamMedium
+    arcLabel.TextSize = 13
+    arcLabel.TextXAlignment = Enum.TextXAlignment.Left
+    arcLabel.Parent = frame
+
+    local arcBtn = Instance.new("TextButton")
+    arcBtn.Size = UDim2.new(0, 60, 0, 24)
+    arcBtn.Position = UDim2.new(1, -70, 0, 134)
+    arcBtn.Font = Enum.Font.GothamBold
+    arcBtn.TextSize = 12
+    arcBtn.TextColor3 = Color3.new(1, 1, 1)
+    arcBtn.Parent = frame
+    Instance.new("UICorner", arcBtn).CornerRadius = UDim.new(0, 5)
+    styleToggle(arcBtn, arcEnabled)
+
+    arcBtn.Activated:Connect(function()
+        arcEnabled = not arcEnabled
+        styleToggle(arcBtn, arcEnabled)
+        if not arcEnabled then hideArc() end
+    end)
+end
+
+createPanel()

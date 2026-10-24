@@ -1,0 +1,93 @@
+--- Ball landing predictor: marks where the ball will land
+
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+-- Settings
+local BALL_NAME = "Ball"          -- change to the ball's actual name in the game
+local STEP = 1 / 60               -- simulation step (seconds)
+local MAX_TIME = 6                -- how far ahead to predict (seconds)
+local MARKER_COLOR = Color3.fromRGB(255, 70, 70)
+
+local ball
+local lastPos, lastTime
+local estVel = Vector3.zero       -- fallback velocity if the ball has no physics velocity
+
+-- Landing marker (flat glowing disc)
+local marker = Instance.new("Part")
+marker.Name = "LandingMarker"
+marker.Shape = Enum.PartType.Cylinder
+marker.Size = Vector3.new(0.15, 5, 5)
+marker.Orientation = Vector3.new(0, 0, 90)
+marker.Anchored = true
+marker.CanCollide = false
+marker.CanQuery = false
+marker.CanTouch = false
+marker.Material = Enum.Material.Neon
+marker.Color = MARKER_COLOR
+marker.Transparency = 0.35
+marker.Parent = Workspace
+
+-- Outline on the ball itself
+local highlight = Instance.new("Highlight")
+highlight.FillColor = MARKER_COLOR
+highlight.FillTransparency = 0.6
+highlight.OutlineColor = Color3.new(1, 1, 1)
+highlight.Parent = Workspace
+
+local function findBall()
+    local found = Workspace:FindFirstChild(BALL_NAME, true)
+    if found and found:IsA("BasePart") then return found end
+    if found and found:IsA("Model") then return found.PrimaryPart or found:FindFirstChildWhichIsA("BasePart") end
+end
+
+local function getVelocity(dt)
+    local v = ball.AssemblyLinearVelocity
+    if v.Magnitude > 0.1 then return v end
+    return estVel  -- anchored or custom-moved ball: use position changes instead
+end
+
+local function predictLanding(pos, vel)
+    local gravity = Vector3.new(0, -Workspace.Gravity, 0)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { ball, marker, game.Players.LocalPlayer.Character }
+
+    local t = 0
+    while t < MAX_TIME do
+        local newPos = pos + vel * STEP + 0.5 * gravity * STEP * STEP
+        local hit = Workspace:Raycast(pos, newPos - pos, params)
+        if hit then return hit.Position end
+        vel = vel + gravity * STEP
+        pos = newPos
+        t += STEP
+    end
+    return nil
+end
+
+RunService.Heartbeat:Connect(function(dt)
+    if not ball or not ball.Parent then
+        ball = findBall()
+        lastPos = nil
+        marker.Transparency = 1
+        highlight.Adornee = nil
+        return
+    end
+
+    -- Estimate velocity from movement (smoothed)
+    if lastPos and dt > 0 then
+        local raw = (ball.Position - lastPos) / dt
+        estVel = estVel:Lerp(raw, 0.5)
+    end
+    lastPos = ball.Position
+
+    highlight.Adornee = ball
+
+    local landing = predictLanding(ball.Position, getVelocity(dt))
+    if landing then
+        marker.Transparency = 0.35
+        marker.CFrame = CFrame.new(landing + Vector3.new(0, 0.1, 0)) * CFrame.Angles(0, 0, math.rad(90))
+    else
+        marker.Transparency = 1
+    end
+end)

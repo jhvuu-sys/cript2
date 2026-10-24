@@ -1,4 +1,4 @@
---- Ball landing predictor with trajectory arc, color panel, and on/off switches
+--- Ball landing predictor: tracks every ball, marker + arc per ball, color panel, switches
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -7,9 +7,13 @@ local Workspace = game:GetService("Workspace")
 local player = Players.LocalPlayer
 
 -- Settings
-local BALL_NAME = "Ball"          -- change to your ball's actual name
+local BALL_NAME = "Ball"          -- every Part or Model with this name gets tracked
+local MAX_BALLS = 10              -- safety cap on how many balls are tracked at once
 local STEP = 1 / 30               -- simulation step (seconds)
 local MAX_TIME = 6                -- how far ahead to predict (seconds)
+
+local IGNORE_INVISIBLE = true     -- skip parts that are (nearly) transparent
+local INVISIBLE_THRESHOLD = 0.95  -- Transparency at or above this counts as invisible
 
 local ARC_STRIDE = 2              -- draw one segment per this many steps (higher = fewer parts)
 local ARC_THICKNESS = 0.25
@@ -29,39 +33,112 @@ local PRESETS = {
     Color3.fromRGB(190, 100, 255), -- purple
 }
 
-local ball
-local lastPos
-local estVel = Vector3.zero
-
 ---------------------------------------------------------------------
--- Marker, highlight, and arc
+-- Shared folders (one place for the raycast to ignore all visuals)
 ---------------------------------------------------------------------
-local marker = Instance.new("Part")
-marker.Name = "LandingMarker"
-marker.Shape = Enum.PartType.Cylinder
-marker.Size = Vector3.new(0.15, 5, 5)
-marker.Anchored = true
-marker.CanCollide = false
-marker.CanQuery = false
-marker.CanTouch = false
-marker.Material = Enum.Material.Neon
-marker.Transparency = 1
-marker.Parent = Workspace
+local markerFolder = Instance.new("Folder")
+markerFolder.Name = "LandingMarkers"
+markerFolder.Parent = Workspace
 
-local highlight = Instance.new("Highlight")
-highlight.FillTransparency = 0.6
-highlight.OutlineColor = Color3.new(1, 1, 1)
-highlight.Parent = Workspace
-
--- Arc segments live in one folder so the raycast can ignore them all
 local arcFolder = Instance.new("Folder")
-arcFolder.Name = "TrajectoryArc"
+arcFolder.Name = "TrajectoryArcs"
 arcFolder.Parent = Workspace
 
-local segments = {}  -- pooled parts, reused every frame
+local highlightFolder = Instance.new("Folder")
+highlightFolder.Name = "BallHighlights"
+highlightFolder.Parent = Workspace
 
-local function getSegment(index)
-    local seg = segments[index]
+---------------------------------------------------------------------
+-- Per-ball tracking
+---------------------------------------------------------------------
+local balls = {}      -- [instance] = data table for that ball
+local ballCount = 0
+
+local function createMarker()
+    local marker = Instance.new("Part")
+    marker.Name = "LandingMarker"
+    marker.Shape = Enum.PartType.Cylinder
+    marker.Size = Vector3.new(0.15, 5, 5)
+    marker.Anchored = true
+    marker.CanCollide = false
+    marker.CanQuery = false
+    marker.CanTouch = false
+    marker.Material = Enum.Material.Neon
+    marker.Color = markerColor
+    marker.Transparency = 1
+    marker.Parent = markerFolder
+    return marker
+end
+
+local function createHighlight()
+    local highlight = Instance.new("Highlight")
+    highlight.FillColor = markerColor
+    highlight.FillTransparency = 0.6
+    highlight.OutlineColor = Color3.new(1, 1, 1)
+    highlight.Parent = highlightFolder
+    return highlight
+end
+
+local function addBall(inst)
+    if balls[inst] then return end
+    if inst.Name ~= BALL_NAME then return end
+    if not (inst:IsA("BasePart") or inst:IsA("Model")) then return end
+    if ballCount >= MAX_BALLS then return end
+
+    local folder = Instance.new("Folder")
+    folder.Name = "Arc"
+    folder.Parent = arcFolder
+
+    balls[inst] = {
+        inst = inst,
+        part = nil,
+        lastPos = nil,
+        estVel = Vector3.zero,
+        marker = createMarker(),
+        highlight = createHighlight(),
+        folder = folder,
+        segments = {},  -- pooled arc parts for this ball
+    }
+    ballCount += 1
+end
+
+local function removeBall(inst)
+    local data = balls[inst]
+    if not data then return end
+    data.marker:Destroy()
+    data.highlight:Destroy()
+    data.folder:Destroy()
+    balls[inst] = nil
+    ballCount -= 1
+end
+
+-- Resolves the BasePart to read position/velocity from (handles Models)
+local function getPart(data)
+    local part = data.part
+    if part and part.Parent then return part end
+
+    local inst = data.inst
+    if inst:IsA("BasePart") then
+        part = inst
+    else
+        part = inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart", true)
+    end
+    data.part = part
+    return part
+end
+
+-- Pick up balls that already exist, then watch for new/removed ones
+for _, d in ipairs(Workspace:GetDescendants()) do
+    addBall(d)
+end
+Workspace.DescendantAdded:Connect(addBall)
+Workspace.DescendantRemoving:Connect(removeBall)
+
+---------------------------------------------------------------------
+-- Arc drawing (per ball)
+---------------------------------------------------------------------
+local function getSegment(data, index)
+    local seg = data.segments[index]
     if not seg then
         seg = Instance.new("Part")
         seg.Anchored = true
@@ -71,19 +148,19 @@ local function getSegment(index)
         seg.CastShadow = false
         seg.Material = Enum.Material.Neon
         seg.Transparency = 1
-        seg.Parent = arcFolder
-        segments[index] = seg
+        seg.Parent = data.folder
+        data.segments[index] = seg
     end
     return seg
 end
 
-local function hideArc()
-    for _, seg in ipairs(segments) do
+local function hideArc(data)
+    for _, seg in ipairs(data.segments) do
         seg.Transparency = 1
     end
 end
 
-local function drawArc(points)
+local function drawArc(data, points)
     local used = 0
     local i = 1
     while i < #points do
@@ -92,7 +169,7 @@ local function drawArc(points)
 
         local a, b = points[i], points[j]
         local length = (b - a).Magnitude
-        local seg = getSegment(used)
+        local seg = getSegment(data, used)
 
         if length > 0.01 and not (ARC_DASHED and used % 2 == 0) then
             seg.Size = Vector3.new(ARC_THICKNESS, ARC_THICKNESS, length)
@@ -106,59 +183,83 @@ local function drawArc(points)
         i = j
     end
 
-    -- Hide leftover segments from a longer arc on a previous frame
-    for k = used + 1, #segments do
-        segments[k].Transparency = 1
+    for k = used + 1, #data.segments do
+        data.segments[k].Transparency = 1
+    end
+end
+
+local function hideBall(data)
+    data.marker.Transparency = 1
+    data.highlight.Adornee = nil
+    hideArc(data)
+end
+
+local function hideAll()
+    for _, data in pairs(balls) do
+        hideBall(data)
     end
 end
 
 local function setMarkerColor(color)
     markerColor = color
-    marker.Color = color
-    highlight.FillColor = color
+    for _, data in pairs(balls) do
+        data.marker.Color = color
+        data.highlight.FillColor = color
+    end
     -- arc segments pick up the new color on the next draw
-end
-setMarkerColor(markerColor)
-
-local function hideVisuals()
-    marker.Transparency = 1
-    highlight.Adornee = nil
-    hideArc()
 end
 
 ---------------------------------------------------------------------
 -- Prediction
 ---------------------------------------------------------------------
-local function findBall()
-    local found = Workspace:FindFirstChild(BALL_NAME, true)
-    if found and found:IsA("BasePart") then return found end
-    if found and found:IsA("Model") then
-        return found.PrimaryPart or found:FindFirstChildWhichIsA("BasePart")
+local skipped = setmetatable({}, { __mode = "k" })  -- invisible parts we've learned to ignore
+local params                                         -- shared by all balls, rebuilt each frame
+
+local function buildParams()
+    local ignore = { markerFolder, arcFolder, highlightFolder }
+    for inst in pairs(balls) do
+        table.insert(ignore, inst)  -- every tracked ball ignores every other ball
     end
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr.Character then table.insert(ignore, plr.Character) end
+    end
+    for part in pairs(skipped) do
+        table.insert(ignore, part)
+    end
+
+    local p = RaycastParams.new()
+    p.FilterType = Enum.RaycastFilterType.Exclude
+    p.FilterDescendantsInstances = ignore
+    p.RespectCanCollide = true  -- ignores parts with CanCollide = false
+    return p
 end
 
-local function getVelocity()
-    local v = ball.AssemblyLinearVelocity
-    if v.Magnitude > 0.1 then return v end
-    return estVel
+-- Casts one segment, skipping invisible parts and re-casting past them
+local function castSegment(from, to)
+    for _ = 1, 6 do
+        local hit = Workspace:Raycast(from, to - from, params)
+        if not hit then return nil end
+
+        local part = hit.Instance
+        if IGNORE_INVISIBLE and part.Transparency >= INVISIBLE_THRESHOLD then
+            skipped[part] = true
+            params = buildParams()
+        else
+            return hit
+        end
+    end
+    return nil
 end
 
 -- Returns the landing position (or nil) and every point along the path
 local function predictLanding(pos, vel)
     local gravity = Vector3.new(0, -Workspace.Gravity, 0)
 
-    local ignore = { ball, marker, arcFolder }
-    if player.Character then table.insert(ignore, player.Character) end
-
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = ignore
-
     local points = { pos }
     local t = 0
     while t < MAX_TIME do
         local newPos = pos + vel * STEP + 0.5 * gravity * STEP * STEP
-        local hit = Workspace:Raycast(pos, newPos - pos, params)
+        local hit = castSegment(pos, newPos)
         if hit then
             table.insert(points, hit.Position)
             return hit.Position, points
@@ -173,38 +274,48 @@ end
 
 RunService.Heartbeat:Connect(function(dt)
     if not enabled then
-        hideVisuals()
-        lastPos = nil
+        hideAll()
+        for _, data in pairs(balls) do
+            data.lastPos = nil
+        end
         return
     end
 
-    if not ball or not ball.Parent then
-        ball = findBall()
-        lastPos = nil
-        hideVisuals()
-        return
-    end
+    params = buildParams()  -- once per frame, shared by every ball
 
-    if lastPos and dt > 0 then
-        estVel = estVel:Lerp((ball.Position - lastPos) / dt, 0.5)
-    end
-    lastPos = ball.Position
+    for inst, data in pairs(balls) do
+        local part = getPart(data)
 
-    highlight.Adornee = ball
+        if not part then
+            data.lastPos = nil
+            hideBall(data)
+        else
+            if data.lastPos and dt > 0 then
+                data.estVel = data.estVel:Lerp((part.Position - data.lastPos) / dt, 0.5)
+            end
+            data.lastPos = part.Position
 
-    local landing, points = predictLanding(ball.Position, getVelocity())
+            local vel = part.AssemblyLinearVelocity
+            if vel.Magnitude <= 0.1 then vel = data.estVel end
 
-    if landing then
-        marker.Transparency = 0.35
-        marker.CFrame = CFrame.new(landing + Vector3.new(0, 0.1, 0)) * CFrame.Angles(0, 0, math.rad(90))
-    else
-        marker.Transparency = 1
-    end
+            data.highlight.Adornee = inst
 
-    if arcEnabled then
-        drawArc(points)
-    else
-        hideArc()
+            local landing, points = predictLanding(part.Position, vel)
+
+            if landing then
+                data.marker.Transparency = 0.35
+                data.marker.CFrame = CFrame.new(landing + Vector3.new(0, 0.1, 0))
+                    * CFrame.Angles(0, 0, math.rad(90))
+            else
+                data.marker.Transparency = 1
+            end
+
+            if arcEnabled then
+                drawArc(data, points)
+            else
+                hideArc(data)
+            end
+        end
     end
 end)
 
@@ -245,7 +356,6 @@ local function createPanel()
     title.TextXAlignment = Enum.TextXAlignment.Left
     title.Parent = frame
 
-    -- Main ON/OFF switch
     local toggleBtn = Instance.new("TextButton")
     toggleBtn.Size = UDim2.new(0, 60, 0, 24)
     toggleBtn.Position = UDim2.new(1, -70, 0, 8)
@@ -259,10 +369,9 @@ local function createPanel()
     toggleBtn.Activated:Connect(function()
         enabled = not enabled
         styleToggle(toggleBtn, enabled)
-        if not enabled then hideVisuals() end
+        if not enabled then hideAll() end
     end)
 
-    -- Preset swatches
     for i, color in ipairs(PRESETS) do
         local swatch = Instance.new("TextButton")
         swatch.Size = UDim2.new(0, 28, 0, 28)
@@ -277,7 +386,6 @@ local function createPanel()
         end)
     end
 
-    -- Custom hex color
     local hexLabel = Instance.new("TextLabel")
     hexLabel.Size = UDim2.new(0, 50, 0, 26)
     hexLabel.Position = UDim2.new(0, 10, 0, 90)
@@ -316,7 +424,6 @@ local function createPanel()
         end
     end)
 
-    -- Arc ON/OFF switch
     local arcLabel = Instance.new("TextLabel")
     arcLabel.Size = UDim2.new(1, -90, 0, 24)
     arcLabel.Position = UDim2.new(0, 10, 0, 134)
@@ -341,7 +448,9 @@ local function createPanel()
     arcBtn.Activated:Connect(function()
         arcEnabled = not arcEnabled
         styleToggle(arcBtn, arcEnabled)
-        if not arcEnabled then hideArc() end
+        if not arcEnabled then
+            for _, data in pairs(balls) do hideArc(data) end
+        end
     end)
 end
 
